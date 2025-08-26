@@ -271,6 +271,13 @@ class BlockDescriptorOptions:
         return self.params.offsets
 
     @classmethod
+    def _should_remove_singleton_dims(cls) -> bool:
+        # Whether singleton dimensions should be dropped
+        # when creating the BlockDescriptorOptions.
+        # This method can be removed when block ptrs are deprecated
+        return True
+
+    @classmethod
     def create(
         cls,
         *,
@@ -291,52 +298,35 @@ class BlockDescriptorOptions:
         params.shape = lookup_size(params.shape)
         params.strides = lookup_size(params.strides)
 
+        # Remove outer singleton dimensions to simplify as they
+        # are not necessary
+        if cls._should_remove_singleton_dims():
+            params = params.remove_outermost_singleton_dims()
+
         # Strip out dimensions of stride 0.
         # These will be restored with tl.broadcast_to.
         broadcasting_dims = [
             sizevars.statically_known_equals(stride, 0) for stride in params.strides
         ]
 
-        # Strip out dimensions of size 1.
-        # These will be restored by tl.reshape.
-        singleton_dims = [
-            sizevars.statically_known_equals(dim, 1) for dim in params.block_shape
-        ]
-        if all(singleton_dims):
-            # Handle a pure singletons, e.g. [1, 1]
-            singleton_dims[-1] = False
-
         # Record the post-broadcast shape before broadcasting dims are removed.
         # The pre-broadcast shape is identical to this, except broadcasting dims are
         # replaced with 1.
-        broadcast_shape = [
-            dim
-            for dim, is_singleton in zip(params.block_shape, singleton_dims)
-            if not is_singleton
-        ]
+        broadcast_shape = params.block_shape
 
-        # Combine all removable dims.
-        removable_dims = [any(dims) for dims in zip(singleton_dims, broadcasting_dims)]
-
-        # Remove singleton_dims from broadcasting_dims so that
-        # broadcast_shape and broadcasting_dims have the same length
-        broadcasting_dims = [
-            dim
-            for dim, is_singleton in zip(broadcasting_dims, singleton_dims)
-            if not is_singleton
-        ]
-
-        def remove_dims(it):
-            """Removes any broadcasting or singleton dims from a given sequence"""
+        def remove_broadcast_dims(it):
             return [
                 item
-                for item, is_removable in zip(it, removable_dims)
-                if not is_removable
+                for item, is_broadcast in zip(it, broadcasting_dims)
+                if not is_broadcast
             ]
 
-        # Drop removable dimensions from the input.
+        # Drop broadcast dimensions
         params = BlockParameters(
-            **{key: remove_dims(val) for key, val in dataclasses.asdict(params).items()}
+            **{
+                key: remove_broadcast_dims(val)
+                for key, val in dataclasses.asdict(params).items()
+            }
         )
 
         # Compute the final shape, adjusting for special kernel types.
@@ -460,6 +450,7 @@ class BlockDescriptorOptions:
         initial_shape: Sequence[sympy.Expr],
         final_shape: Sequence[sympy.Expr],
         allow_implicit: bool,
+        for_store: bool,
     ) -> str:
         """
         Generate a broadcast and a reshape for the block descriptor.
@@ -500,6 +491,172 @@ class BlockDescriptorOptions:
 
 @dataclasses.dataclass
 class TensorDescriptorOptions(BlockDescriptorOptions):
+    block_param_dim_sort_indices: Optional[list[int]] = None
+    block_param_revert_dim_sort_indices: Optional[list[int]] = None
+
+    @classmethod
+    def _should_remove_singleton_dims(cls) -> bool:
+        return False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        params: BlockParameters,
+        constant_offset: sympy.Expr,
+        range_trees: list[IterationRangesRoot],
+        mask_vars: OrderedSet[str],
+        get_max_block: Callable[[str], int],
+    ) -> TensorDescriptorOptions:
+        # [Note: TMA stride order]
+        # Currently tensor descriptors require that the innermost dimension is contiguous
+        # when the tensor descriptor is defined.
+        # So e.g. tl.make_tensor_descriptor(block_shape=[XBLOCK], strides=[16]) and
+        # tl.make_tensor_descriptor(block_shape=[XBLOCK, YBLOCK], strides=[1, 16])
+        # are invalid. For the first case, an innermost dimension of size 1 with stride 1
+        # can be added with the loaded value viewed as a rank 1 tensor.
+        # For the second case the dimensions can be sorted in descending
+        # order based on the strides. Transposes are then required depending on
+        # the type of memory access operation:
+        # - For load operations, the input will be transposed back to the kernel
+        # tile shape after. If broadcasting is needed, the transpose will be applied after.
+        # - For store operations, the value will have the kernel tile shape and will need
+        # to be transposed to match the contiguous tensor descriptor. If broadcasting is required,
+        # the broadcast parameters will need to be reverted to the original before broadcasting
+        # is applied since the broadcasting parameters will be in sorted form. The
+        # transpose will then be appleid after broadcasting.
+
+        sizevars = V.graph.sizevars
+
+        def lookup_size(exprs: Iterable[sympy.Expr]) -> list[sympy.Expr]:
+            return [sizevars.lookup_precomputed_size(expr) for expr in exprs]
+
+        # Look up precomputed sizes
+        params.shape = lookup_size(params.shape)
+        params.strides = lookup_size(params.strides)
+
+        requires_permute = False
+        dim_sort_indices = None
+        revert_dim_sort_indices = None
+        params = params.remove_outermost_singleton_dims()
+        try:
+            index_stride_1 = params.strides.index(sympy.Integer(1))
+            # If not innermost, permute
+            if index_stride_1 != len(params.strides) - 1:
+                requires_permute = True
+                params, dim_sort_indices, revert_dim_sort_indices = (
+                    params.sort_by_desc_stride_order()
+                )
+        except ValueError:
+            # No dimension has a stride of 1
+            dummy_dim = BlockParameters(
+                shape=[sympy.Integer(1)],
+                block_shape=[sympy.Integer(1)],
+                strides=[sympy.Integer(1)],
+                offsets=[sympy.Integer(0)],
+            )
+            params += dummy_dim
+
+        options = super().create(
+            params=params,
+            constant_offset=constant_offset,
+            range_trees=range_trees,
+            mask_vars=mask_vars,
+            get_max_block=get_max_block,
+        )
+        options = cast(TensorDescriptorOptions, options)
+        if requires_permute:
+            options.block_param_dim_sort_indices = dim_sort_indices
+            options.block_param_revert_dim_sort_indices = revert_dim_sort_indices
+        return options
+
+    def codegen_broadcast_and_reshape(
+        self,
+        value: str,
+        initial_shape: Sequence[sympy.Expr],
+        final_shape: Sequence[sympy.Expr],
+        allow_implicit: bool,
+        for_store: bool,
+    ) -> str:
+        """
+        Generate a broadcast and a reshape for the tensor descriptor.
+        This restores stride-0 dimensions which were removed from the block
+        descriptor and also transposes the input to that required by the kernel
+        or tensor descriptor for loads and stores respectively.
+        """
+
+        broadcast_shape = self.broadcast_shape
+        broadcasting_dims = self.broadcasting_dims
+
+        def sort_param(param: Sequence[Any], sort_indices: list[int]):
+            return [param[i] for i in sort_indices]
+
+        # See Note: TMA stride order
+        # If the block parameters have been sorted by descending strides,
+        # permute the broadcasting parameters so that they are compatible
+        # with the value being stored. This is because the dimensions
+        # of the value being stored are not sorted in descending stride order,
+        # but the broadcasting parameters are based on the dims in sorted order
+        if for_store and self.block_param_revert_dim_sort_indices:
+            broadcast_shape = sort_param(
+                self.broadcast_shape, self.block_param_revert_dim_sort_indices
+            )
+            broadcasting_dims = sort_param(
+                self.broadcasting_dims, self.block_param_revert_dim_sort_indices
+            )
+
+        # Reshape to add singletons.
+        pre_broadcast_shape = [
+            sympy.S.One if is_broadcasting else dim
+            for dim, is_broadcasting in zip(broadcast_shape, broadcasting_dims)
+        ]
+        value = triton_reshape(value, initial_shape, pre_broadcast_shape)
+
+        # Broadcast singletons.
+        # For loads, we can often implicitly broadcast singleton dimensions.
+        # We need an explicit broadcast for stores, or if the final reshape does more
+        # than add singletons.
+        sizevars = V.graph.sizevars
+        supports_implicit_broadcast = allow_implicit and (
+            len(pre_broadcast_shape) == len(final_shape)
+            and all(
+                sizevars.statically_known_equals(pre_dim, 1)
+                or sizevars.statically_known_equals(pre_dim, post_dim)
+                for pre_dim, post_dim in zip(pre_broadcast_shape, final_shape)
+            )
+        )
+
+        if any(broadcasting_dims) and not supports_implicit_broadcast:
+            value = (
+                f"tl.broadcast_to({value}, {V.kernel.index_to_str(broadcast_shape)})"
+            )
+
+        old_shape = self.broadcast_shape
+        if self.block_param_revert_dim_sort_indices:
+            # See Note: TMA stride order
+            # Sort dims by strides if storing since the transform is:
+            # (unsorted) broadcasted kernel tile shape -> (sorted) block descriptor shape
+            # Revert dim sort if loading since the transform is:
+            # (sorted) broadcasted block descriptor shape -> (unsorted) kernel tile shape
+            permute_dims = (
+                self.block_param_dim_sort_indices
+                if for_store
+                else self.block_param_revert_dim_sort_indices
+            )
+            value = f"tl.trans({value}, {permute_dims})"
+            old_shape = (
+                self.broadcast_shape
+                if for_store
+                else sort_param(
+                    self.broadcast_shape, self.block_param_revert_dim_sort_indices
+                )
+            )
+
+        # Reshape to the final shape.
+        value = triton_reshape(value, old_shape, final_shape)
+
+        return value
+
     def format(self, name: str, roffset=True) -> str:
         """
         Codegen a call to tl.make_tensor_descriptor()
@@ -1637,6 +1794,68 @@ class BlockParameters:
         a, b = tuple(dataclasses.asdict(x) for x in (self, other))
         return cls(**{key: a[key] + b[key] for key in a})
 
+    def remove_outermost_singleton_dims(self) -> BlockParameters:
+        """
+        Remove singleton dimensions from BlockParameters. If all
+        dimensions are singleton dimensions, the last dimension is preserved
+        so that the returned block parameter is non-empty
+        """
+        # Strip out dimensions of size 1.
+        singleton_dims = [
+            V.graph.sizevars.statically_known_equals(dim, 1) for dim in self.block_shape
+        ]
+
+        if all(singleton_dims):
+            # Handle a pure singletons, e.g. [1, 1]
+            singleton_dims[-1] = False
+
+        def remove_singleton_dimensions(it):
+            return [
+                item
+                for (item, is_singleton) in zip(it, singleton_dims)
+                if not is_singleton
+            ]
+
+        return BlockParameters(
+            **{
+                key: remove_singleton_dimensions(val)
+                for key, val in dataclasses.asdict(self).items()
+            }
+        )
+
+    def sort_by_desc_stride_order(self) -> tuple[BlockParameters, list[int], list[int]]:
+        """
+        Returns block parameters sorted by strides in descending order as well as
+        the indices used to sort the strides and the indices to revert the block parameter
+        back to the original
+
+        For example if block_shape @ strides is [ZBLOCK, XBLOCK, YBLOCK] @ [8, 1, 16]
+        The indices to sort the strides in descending order will be [2, 0, 1].
+        The indices to revert back to the original order will be [1, 2, 0].
+        """
+        sorted_dims_by_strides_map = {
+            k: i
+            for i, k in enumerate(
+                sorted(
+                    range(len(self.strides)),
+                    key=lambda x: self.strides[x],
+                    reverse=True,
+                )
+            )
+        }
+
+        def sort_params(attr):
+            return [attr[i] for i in sorted_dims_by_strides_map]
+
+        params = BlockParameters(
+            **{key: sort_params(val) for key, val in dataclasses.asdict(self).items()}
+        )
+        revert_dim_sort_indices = [
+            sorted_dims_by_strides_map[i]
+            for i in range(len(sorted_dims_by_strides_map))
+        ]
+        return params, list(sorted_dims_by_strides_map.keys()), revert_dim_sort_indices
+
 
 class CooperativeReductionWorkspaceCache:
     """
@@ -2294,27 +2513,31 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
                 # Form the block pointer or TMA descriptor.
                 self.filter_masks(mask_vars)
-                options_class: type[BlockDescriptorOptions]
-                if config.triton.use_block_ptr:
-                    options_class = BlockPtrOptions
-                else:
-                    nonlocal tma_compatibility_checker
-                    tma_compatibility_checker = cast(
-                        TMACompatibilityChecker, tma_compatibility_checker
-                    )
-                    if not tma_compatibility_checker.are_block_parameters_compatible(
-                        block_params
-                    ):
-                        return None
-                    options_class = TensorDescriptorOptions
+                options_class = (
+                    BlockPtrOptions
+                    if config.triton.use_block_ptr
+                    else TensorDescriptorOptions
+                )
 
-                return options_class.create(
+                options = options_class.create(
                     params=block_params,
                     constant_offset=offset,
                     range_trees=range_trees,
                     mask_vars=mask_vars,
                     get_max_block=self.max_block,
                 )
+
+                if config.triton.use_tensor_descriptor:
+                    nonlocal tma_compatibility_checker
+                    tma_compatibility_checker = cast(
+                        TMACompatibilityChecker, tma_compatibility_checker
+                    )
+                    if not tma_compatibility_checker.are_block_parameters_compatible(
+                        options.params
+                    ):
+                        return None
+
+                return options
 
             # Return a block pointer, if indexing matches the pattern.
             options = match_block_expr()
@@ -2458,7 +2681,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 indexing.broadcasting_dims[idx] = False
 
         value = indexing.codegen_broadcast_and_reshape(
-            value, indexing.final_shape, indexing.block_shape, False
+            value, indexing.final_shape, indexing.block_shape, False, for_store=True
         )
 
         # workaround https://github.com/triton-lang/triton/issues/2814
@@ -2610,7 +2833,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 else:
                     line = f"{block_descriptor}.load({V.kernel.index_to_str(indexing.offsets)})"
                 line = indexing.codegen_broadcast_and_reshape(
-                    line, indexing.block_shape, indexing.final_shape, True
+                    line,
+                    indexing.block_shape,
+                    indexing.final_shape,
+                    True,
+                    for_store=False,
                 )
                 shape = indexing.final_shape
             elif isinstance(original_index, sympy.Integer):
