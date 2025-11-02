@@ -1635,7 +1635,7 @@ class GeneratedCodeCache:
                 "num_buffers_warp_spec": num_buffers_warp_spec,
                 "epilogue_fn_hash": epilogue_fn_hash,
                 "tma_store": tma_store,
-                "transpose_discontiguous_tensor_descriptors_override": transpose_discontiguous_tensor_descriptors_override
+                "transpose_discontiguous_tensor_descriptors_override": transpose_discontiguous_tensor_descriptors_override,
                 "kwargs": kwargs,
                 "hint_override": hint_override,
             }

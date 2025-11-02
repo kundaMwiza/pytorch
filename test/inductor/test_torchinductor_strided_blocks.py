@@ -81,7 +81,6 @@ TMA_TEST_XFAIL = dict.fromkeys(
         "test_broadcast_prefer_nd_tiling_False_x_size2_y_size2",
         "test_broadcast_prefer_nd_tiling_True_x_size0_y_size0",
         "test_broadcast_prefer_nd_tiling_True_x_size2_y_size2",
-        "test_broadcast_with_singleton_dims",
     ),
     TMA_XFAIL,
 )
@@ -1014,7 +1013,6 @@ class CommonTemplate:
         # Check the code for multiple Rn_BLOCK's
         self._assert_reduction_ndims(code, 2 if tile_reductions else 1)
 
-    @xfail_if_use_tensor_descriptor
     def test_complex_reshape_block_ptr(self):
         def func(x, y):
             add_ = x + y
@@ -1411,7 +1409,7 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
     @parametrize(
         "view_size,permute_order,num_tensor_descriptors,expect_transpose",
         [
-            ((128,), (0), 3, False),
+            ((128,), (0,), 3, False),
             ((128, 128), (0, 1), 3, False),
             ((128, 64), (1, 0), 3, True),
             ((256, 32, 16), (2, 0, 1), 3, True),
